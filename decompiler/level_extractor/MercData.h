@@ -241,6 +241,7 @@ struct MercCtrl {
   s32 num_joints;
   MercCtrlHeader header;
   std::vector<MercEffect> effects;
+  std::vector<u64> seg_table;
 
   void from_ref(TypedRef tr, const DecompilerTypeSystem& dts, GameVersion version);
   std::string print();
