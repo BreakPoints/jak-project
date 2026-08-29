@@ -1727,6 +1727,7 @@ void extract_merc(const ObjectFileData& ag_data,
     pc_ctrl.st_vif_add = ctrl.header.st_vif_add;
     pc_ctrl.st_magic = u32_as_float(ctrl.header.st_magic);
     pc_ctrl.xyz_scale = ctrl.header.xyz_scale;
+    pc_ctrl.seg_table = ctrl.seg_table;
 
     for (size_t ei = 0; ei < ctrls[ci].effects.size(); ei++) {
       indices_temp[ci].emplace_back();
