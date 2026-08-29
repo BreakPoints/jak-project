@@ -447,6 +447,29 @@ void MercCtrl::from_ref(TypedRef tr, const DecompilerTypeSystem& dts, GameVersio
       TypedRef(get_field_ref(tr, "header", dts), dts.ts.lookup_type("merc-ctrl-header"));
   header.from_ref(merc_ctrl_header_ref, dts, version);
 
+  // not all game versions have a seg-table field (jak 1 doesn't).
+  auto* ctrl_type = dynamic_cast<StructureType*>(tr.type);
+  Field seg_table_field;
+  if (ctrl_type && ctrl_type->lookup_field("seg-table", &seg_table_field)) {
+    // seg-table is a pointer to a boxed (array uint64). The label convention points at the
+    // array's length field, so relative to the dereferenced label the layout is:
+    // [length][allocated-length][content type][data...] (the type tag word precedes the label).
+    auto seg_table_ref = get_field_ref(tr, "seg-table", dts);
+    const auto& seg_table_word =
+        tr.ref.data->words_by_seg.at(seg_table_ref.seg).at(seg_table_ref.byte_offset / 4);
+    if (seg_table_word.kind() == decompiler::LinkedWord::PTR) {
+      Ref arr = deref_label(seg_table_ref);
+      u32 seg_count = deref_u32(arr, 0);
+      for (u32 i = 0; i < seg_count; i++) {
+        // elements start 3 words after the length field. read as two u32s since the array object
+        // is not guaranteed to be 8-byte aligned.
+        u32 lo = deref_u32(arr, 3 + i * 2);
+        u32 hi = deref_u32(arr, 4 + i * 2);
+        seg_table.push_back(((u64)hi << 32) | lo);
+      }
+    }
+  }
+
   auto eff_ref = TypedRef(get_field_ref(tr, "effect", dts), dts.ts.lookup_type("merc-effect"));
   for (u32 i = 0; i < header.effect_count; i++) {
     effects.emplace_back().from_ref(eff_ref, dts, header);
@@ -479,6 +502,12 @@ std::string MercCtrl::print() {
   std::string result;
   result += fmt::format("name: {}\n", name);
   result += fmt::format("num_joints: {}\n", num_joints);
+  if (!seg_table.empty()) {
+    result += fmt::format("seg-table ({} entries):\n", seg_table.size());
+    for (u32 i = 0; i < seg_table.size(); i++) {
+      result += fmt::format("  [{}] #x{:x}\n", i, seg_table[i]);
+    }
+  }
   result += "+ HEADER\n";
   result += header.print();
   result += "\n";

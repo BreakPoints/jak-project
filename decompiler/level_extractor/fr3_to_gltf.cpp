@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 #include <tuple>
 
 #include "common/custom_data/Tfrag3Data.h"
@@ -1441,7 +1442,7 @@ int make_anim_vec4_accessor(const std::vector<math::Vector4f>& values, tinygltf:
 void add_animation_to_gltf(const level_tools::UncompressedJointAnim& anim,
                            const tinygltf::Skin& skin,
                            tinygltf::Model& model,
-                           int mesh_node_idx,
+                           const std::vector<int>& mesh_node_idxs,
                            int num_targets) {
   if (anim.frames == 0 || anim.joints.size() <= 2)
     return;
@@ -1494,10 +1495,12 @@ void add_animation_to_gltf(const level_tools::UncompressedJointAnim& anim,
     sampler.input = time_acc;
     sampler.output = make_anim_float_accessor(weights, model);
     sampler.interpolation = "LINEAR";
-    auto& channel = gltf_anim.channels.emplace_back();
-    channel.sampler = si;
-    channel.target_node = mesh_node_idx;
-    channel.target_path = "weights";
+    for (int mesh_node_idx : mesh_node_idxs) {
+      auto& channel = gltf_anim.channels.emplace_back();
+      channel.sampler = si;
+      channel.target_node = mesh_node_idx;
+      channel.target_path = "weights";
+    }
   }
 }
 
@@ -1525,7 +1528,7 @@ int make_vec3_float_accessor(const std::vector<float>& data, tinygltf::Model& mo
 
 void add_blerc_targets(const tfrag3::Level& level,
                        const tfrag3::MercModel& mmodel,
-                       tinygltf::Mesh& mesh,
+                       std::vector<tinygltf::Mesh*>& meshes,
                        tinygltf::Model& model) {
   // find max target index across all effects to know how many morph targets we need
   u32 num_targets = 0;
@@ -1606,10 +1609,14 @@ void add_blerc_targets(const tfrag3::Level& level,
     target["NORMAL"] = make_vec3_float_accessor(nrm_deltas[t], model);
   }
 
-  for (auto& prim : mesh.primitives) {
-    prim.targets = morph_targets;
+  // all group meshes share the same vertex accessors, so the same target accessors apply to
+  // every one of them.
+  for (auto* mesh : meshes) {
+    for (auto& prim : mesh->primitives) {
+      prim.targets = morph_targets;
+    }
+    mesh->weights.assign(num_targets, 0.0);
   }
-  mesh.weights.assign(num_targets, 0.0);
 }
 
 void add_merc(const tfrag3::Level& level,
@@ -1634,17 +1641,86 @@ void add_merc(const tfrag3::Level& level,
   auto normal_buffer_accessor = make_normal_buffer_accessor(mverts, model);
 
   const auto& art = art_data.find(mmodel.name);
+
+  // The seg-table maps "segment bits" (the draw-control's seg-mask) to bitmasks of effects: when
+  // a segment bit is set, the effects in that entry are hidden. Vehicles use this for damage
+  // states - each table entry holds the effects shown when a body section is at that level.
+  // Split the model into one node per seg-table entry so the different damage levels end up as
+  // separate nodes in the glb. Effects not covered by any entry are always drawn and stay on the
+  // root node.
+  std::vector<int> effect_group(mmodel.effects.size(), -1);
+  bool has_seg_table = !mmodel.seg_table.empty();
+  if (has_seg_table) {
+    for (size_t ei = 0; ei < mmodel.effects.size(); ei++) {
+      // seg-table entries are u64 bitmasks, so only the first 64 effects can be grouped.
+      if (ei >= 64) {
+        break;
+      }
+      for (size_t si = 0; si < mmodel.seg_table.size(); si++) {
+        if (mmodel.seg_table[si] & (1ull << ei)) {
+          if (effect_group[ei] == -1)
+            effect_group[ei] = (int)si;
+          // if model effect is in multiple seg-table entries, use effect_group[ei]
+          break;
+        }
+      }
+    }
+  }
+
+  // groups that have at least one effect: -1 = base group (root node), then seg-table entries in
+  // index order.
+  std::vector<int> active_groups;
+  if (!has_seg_table) {
+    active_groups.push_back(-1);
+  } else {
+    std::set<int> present(effect_group.begin(), effect_group.end());
+    if (present.count(-1)) {
+      active_groups.push_back(-1);
+    }
+    for (int g = 0; g < (int)mmodel.seg_table.size(); g++) {
+      if (present.count(g)) {
+        active_groups.push_back(g);
+      }
+    }
+  }
+
+  // note: do not hold references into model.nodes across the loop below - adding damage/skin
+  // nodes reallocates the vector and invalidates them.
   int node_idx = (int)model.nodes.size();
-  auto& node = model.nodes.emplace_back();
+  model.nodes.emplace_back();
+  model.nodes[node_idx].name = mmodel.name;
   model.scenes.at(0).nodes.push_back(node_idx);
-  node.name = mmodel.name;
-  int mesh_idx = (int)model.meshes.size();
-  auto& mesh = model.meshes.emplace_back();
-  mesh.name = node.name;
-  node.mesh = mesh_idx;
+
+  std::map<int, int> group_to_node, group_to_mesh;
+  for (int g : active_groups) {
+    if (g == -1) {
+      group_to_node[g] = node_idx;
+      int mesh_idx = (int)model.meshes.size();
+      auto& mesh = model.meshes.emplace_back();
+      mesh.name = mmodel.name;
+      model.nodes[node_idx].mesh = mesh_idx;
+      group_to_mesh[g] = mesh_idx;
+    } else {
+      std::string damage_name = mmodel.name + "_damage_" + std::to_string(g);
+      int damage_node_idx = (int)model.nodes.size();
+      model.nodes.emplace_back();
+      model.nodes[damage_node_idx].name = damage_name;
+      model.nodes[node_idx].children.push_back(damage_node_idx);
+      group_to_node[g] = damage_node_idx;
+
+      int mesh_idx = (int)model.meshes.size();
+      auto& mesh = model.meshes.emplace_back();
+      mesh.name = damage_name;
+      model.nodes[damage_node_idx].mesh = mesh_idx;
+      group_to_mesh[g] = mesh_idx;
+    }
+  }
 
   if (art != art_data.end() && !art->second.joint_group.empty()) {
-    node.skin = model.skins.size();
+    int skin_idx = model.skins.size();
+    for (auto& [g, ni] : group_to_node) {
+      model.nodes[ni].skin = skin_idx;
+    }
     auto& skin = model.skins.emplace_back();
     const auto& game_bones = art->second.joint_group;
     int n_bones = game_bones.size();
@@ -1716,15 +1792,25 @@ void add_merc(const tfrag3::Level& level,
   // when we have animated blend targets, blender adds an extra empty during import,
   // rename it to not conflict with the actual model
   if (num_blend_targets > 0) {
-    model.nodes[node_idx].name = mmodel.name + "_blerc";
+    for (auto& [g, ni] : group_to_node) {
+      model.nodes[ni].name += "_blerc";
+    }
   }
 
-  if (art != art_data.end() && !art->second.anims.empty() && node.skin >= 0 &&
-      node.skin < model.skins.size()) {
-    const auto& skin = model.skins[node.skin];
-    for (const auto& ja : art->second.anims) {
-      auto uncompressed = decompress_anim(ja);
-      add_animation_to_gltf(uncompressed, skin, model, node_idx, (int)num_blend_targets);
+  if (art != art_data.end() && !art->second.anims.empty()) {
+    // note: 'node' above is a reference into model.nodes, which may have been reallocated by the
+    // damage/skeleton nodes added since, so access it by index here.
+    int skin_idx = model.nodes.at(node_idx).skin;
+    if (skin_idx >= 0 && skin_idx < (int)model.skins.size()) {
+      const auto& skin = model.skins[skin_idx];
+      std::vector<int> mesh_node_idxs;
+      for (auto& [g, ni] : group_to_node) {
+        mesh_node_idxs.push_back(ni);
+      }
+      for (const auto& ja : art->second.anims) {
+        auto uncompressed = decompress_anim(ja);
+        add_animation_to_gltf(uncompressed, skin, model, mesh_node_idxs, (int)num_blend_targets);
+      }
     }
   }
 
@@ -1738,6 +1824,8 @@ void add_merc(const tfrag3::Level& level,
       envmap_info.mode = effect.envmap_mode;
       envmap = &envmap_info;
     }
+
+    auto& mesh = model.meshes.at(group_to_mesh.at(effect_group[effect_idx]));
 
     for (size_t draw_idx = 0; draw_idx < effect.all_draws.size(); draw_idx++) {
       const auto& draw = effect.all_draws[draw_idx];
@@ -1762,7 +1850,11 @@ void add_merc(const tfrag3::Level& level,
     }
   }
 
-  add_blerc_targets(level, mmodel, mesh, model);
+  std::vector<tinygltf::Mesh*> group_meshes;
+  for (auto& [g, mi] : group_to_mesh) {
+    group_meshes.push_back(&model.meshes.at(mi));
+  }
+  add_blerc_targets(level, mmodel, group_meshes, model);
 }
 
 void consolidate_buffers(tinygltf::Model& model) {
