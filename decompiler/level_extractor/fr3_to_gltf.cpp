@@ -1619,6 +1619,67 @@ void add_blerc_targets(const tfrag3::Level& level,
   }
 }
 
+// Readable names for vehicle damage groups. Traffic vehicles have per-section damage levels
+// (vehicle-damage-info in goal_src/<game>/levels/city/traffic/vehicle/*.gc): each section has up
+// to 3 levels, and while a section sits at level L the seg-table entry listed below is active.
+// The bit position of each damage-seg-array value is the seg-table entry index.
+struct DamageGroupName {
+  int entry;         // seg-table entry index
+  const char* part;  // vehicle section, e.g. "front_left"
+  int level;         // 0 = undamaged, higher = more damaged
+};
+
+// Returns "<part>_lvl<level>" for known traffic vehicles, or "" if the model/entry is unknown
+// (caller falls back to "damage_<entry>").
+static std::string damage_group_name(const std::string& model_name, int entry) {
+  // strip the lod suffix: "cara-lod0" -> "cara"
+  std::string base = model_name;
+  size_t dash = base.find("-lod");
+  if (dash != std::string::npos) {
+    base = base.substr(0, dash);
+  }
+
+  // cars (cara/carb/carc/hellcat): 4 sections x 3 levels, same layout in Jak 2 and 3
+  static const DamageGroupName kCarSections[] = {
+      {9, "front_left", 0}, {5, "front_left", 1}, {1, "front_left", 2},
+      {10, "rear_left", 0}, {6, "rear_left", 1}, {2, "rear_left", 2},
+      {11, "front_right", 0}, {7, "front_right", 1}, {3, "front_right", 2},
+      {12, "rear_right", 0}, {8, "rear_right", 1}, {4, "rear_right", 2},
+  };
+  // bikes with the "a" layout: only 2 levels on the rear (its third level has a zero mask)
+  static const DamageGroupName kBikeASections[] = {
+      {4, "front", 0}, {3, "front", 1}, {1, "front", 2},
+      {5, "rear", 0}, {2, "rear", 1},
+  };
+  // bikes with the "b" layout: 3 levels on both sections
+  static const DamageGroupName kBikeBSections[] = {
+      {5, "front", 0}, {3, "front", 1}, {1, "front", 2},
+      {6, "rear", 0}, {4, "rear", 1}, {2, "rear", 2},
+  };
+
+  const DamageGroupName* table = nullptr;
+  size_t count = 0;
+  if (base == "cara" || base == "carb" || base == "carc" || base == "hellcat") {
+    table = kCarSections;
+    count = sizeof(kCarSections) / sizeof(kCarSections[0]);
+  } else if (base == "bikea" || base == "newbike") {
+    table = kBikeASections;
+    count = sizeof(kBikeASections) / sizeof(kBikeASections[0]);
+  } else if (base == "bikeb" || base == "bikec" || base == "crimson-bike") {
+    table = kBikeBSections;
+    count = sizeof(kBikeBSections) / sizeof(kBikeBSections[0]);
+  }
+
+  if (table) {
+    for (size_t i = 0; i < count; i++) {
+      if (table[i].entry == entry) {
+        return std::string(table[i].part) + "_lvl" + std::to_string(table[i].level);
+      }
+    }
+  }
+  return "";
+}
+
 void add_merc(const tfrag3::Level& level,
               const std::map<std::string, level_tools::ArtData>& art_data,
               const tfrag3::MercModel& mmodel,
@@ -1701,7 +1762,13 @@ void add_merc(const tfrag3::Level& level,
       model.nodes[node_idx].mesh = mesh_idx;
       group_to_mesh[g] = mesh_idx;
     } else {
-      std::string damage_name = mmodel.name + "_damage_" + std::to_string(g);
+      // readable "<part>_lvl<level>" name where the vehicle class is known,
+      // otherwise fall back to the raw seg-table entry index
+      std::string group_suffix = damage_group_name(mmodel.name, g);
+      if (group_suffix.empty()) {
+        group_suffix = "damage_" + std::to_string(g);
+      }
+      std::string damage_name = mmodel.name + "_" + group_suffix;
       int damage_node_idx = (int)model.nodes.size();
       model.nodes.emplace_back();
       model.nodes[damage_node_idx].name = damage_name;
