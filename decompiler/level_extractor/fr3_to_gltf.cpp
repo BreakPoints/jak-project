@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <map>
-#include <set>
 #include <tuple>
 
 #include "common/custom_data/Tfrag3Data.h"
@@ -1528,7 +1527,7 @@ int make_vec3_float_accessor(const std::vector<float>& data, tinygltf::Model& mo
 
 void add_blerc_targets(const tfrag3::Level& level,
                        const tfrag3::MercModel& mmodel,
-                       std::vector<tinygltf::Mesh*>& meshes,
+                       const std::vector<int>& group_mesh,
                        tinygltf::Model& model) {
   // find max target index across all effects to know how many morph targets we need
   u32 num_targets = 0;
@@ -1610,26 +1609,25 @@ void add_blerc_targets(const tfrag3::Level& level,
   }
 
   // all group meshes share the same vertex accessors, so the same target accessors apply to
-  // every one of them.
-  for (auto* mesh : meshes) {
-    for (auto& prim : mesh->primitives) {
+  // every one of them; groups with no geometry have no mesh and are skipped
+  for (int mi : group_mesh) {
+    if (mi < 0) {
+      continue;
+    }
+    auto& mesh = model.meshes.at(mi);
+    for (auto& prim : mesh.primitives) {
       prim.targets = morph_targets;
     }
-    // glTF requires weights to match the number of morph targets, and a mesh without primitives
-    // has none, so only set weights on meshes that actually have geometry.
-    if (!mesh->primitives.empty()) {
-      mesh->weights.assign(num_targets, 0.0);
-    }
+    mesh.weights.assign(num_targets, 0.0);
   }
 }
 
-// Readable names for vehicle damage groups. Traffic vehicles have per-section damage levels
-// (vehicle-damage-info in goal_src/<game>/levels/city/traffic/vehicle/*.gc): each section has up
-// to 3 levels, and while a section sits at level L the seg-table entry listed below is active.
-// The bit position of each damage-seg-array value is the seg-table entry index.
+// Readable names for vehicle damage groups, based on the per-section damage levels in
+// vehicle-section-info (goal_src/<game>/levels/city/traffic/vehicle/*.gc); each value's bit
+// position there is the seg-table entry index.
 struct DamageGroupName {
   int entry;         // seg-table entry index
-  const char* part;  // vehicle section, e.g. "front_left"
+  const char* part;  // vehicle section, e.g. "front-left"
   int level;         // 0 = undamaged, higher = more damaged
 };
 
@@ -1637,13 +1635,10 @@ struct DamageGroupName {
 // (caller falls back to "damage-<entry>").
 static std::string damage_group_name(const std::string& model_name, int entry) {
   // strip the lod suffix: "cara-lod0" -> "cara"
-  std::string base = model_name;
-  size_t dash = base.find("-lod");
-  if (dash != std::string::npos) {
-    base = base.substr(0, dash);
-  }
+  std::string base = model_name.substr(0, model_name.find("-lod"));
 
-  // cars (cara/carb/carc/hellcat): 4 sections x 3 levels, same layout in Jak 2 and 3
+  // cars (cara/carb/carc/hellcat) and the helldog boss vehicle: 4 sections x 3 levels, same
+  // layout in Jak 2 and 3
   static const DamageGroupName kCarSections[] = {
       {9, "front-left", 0}, {5, "front-left", 1}, {1, "front-left", 2},
       {10, "rear-left", 0}, {6, "rear-left", 1}, {2, "rear-left", 2},
@@ -1663,7 +1658,8 @@ static std::string damage_group_name(const std::string& model_name, int entry) {
 
   const DamageGroupName* table = nullptr;
   size_t count = 0;
-  if (base == "cara" || base == "carb" || base == "carc" || base == "hellcat") {
+  if (base == "cara" || base == "carb" || base == "carc" || base == "hellcat" ||
+      base == "helldog") {
     table = kCarSections;
     count = sizeof(kCarSections) / sizeof(kCarSections[0]);
   } else if (base == "bikea" || base == "newbike") {
@@ -1674,11 +1670,9 @@ static std::string damage_group_name(const std::string& model_name, int entry) {
     count = sizeof(kBikeBSections) / sizeof(kBikeBSections[0]);
   }
 
-  if (table) {
-    for (size_t i = 0; i < count; i++) {
-      if (table[i].entry == entry) {
-        return std::string(table[i].part) + "-lvl" + std::to_string(table[i].level);
-      }
+  for (size_t i = 0; i < count; i++) {
+    if (table[i].entry == entry) {
+      return std::string(table[i].part) + "-lvl" + std::to_string(table[i].level);
     }
   }
   return "";
@@ -1707,112 +1701,76 @@ void add_merc(const tfrag3::Level& level,
 
   const auto& art = art_data.find(mmodel.name);
 
-  // The seg-table maps "segment bits" (the draw-control's seg-mask) to bitmasks of effects: when
-  // a segment bit is set, the effects in that entry are hidden. Vehicles use this for damage
-  // states - each table entry holds the effects shown when a body section is at that level.
-  // Split the model into one node per seg-table entry so the different damage levels end up as
-  // separate nodes in the glb. Effects not covered by any entry are always drawn and stay on the
-  // root node.
-  std::vector<int> effect_group(mmodel.effects.size(), -1);
-  bool has_seg_table = !mmodel.seg_table.empty();
-  if (has_seg_table) {
-    for (size_t ei = 0; ei < mmodel.effects.size(); ei++) {
-      // seg-table entries are u64 bitmasks, so only the first 64 effects can be grouped.
-      if (ei >= 64) {
+  // The seg-table maps segment bits (the draw-control's seg-mask) to effect bitmasks: when a
+  // segment bit is set, that entry's effects are hidden. Traffic vehicles use this for damage
+  // states - one entry per section/level, and while a section sits at level L every other entry
+  // stays active so only that level's geometry shows. Effects not covered by any entry stay on
+  // the root node; each seg-table entry becomes its own node.
+  std::vector<int> effect_group(mmodel.effects.size(), 0);
+  // entries are u64 bitmasks, so only the first 64 effects can be grouped; an effect listed in
+  // multiple entries is assigned to the lowest-indexed one
+  for (size_t ei = 0; ei < mmodel.effects.size() && ei < 64; ei++) {
+    for (size_t si = 0; si < mmodel.seg_table.size(); si++) {
+      if (mmodel.seg_table[si] & (1ull << ei)) {
+        effect_group[ei] = (int)si + 1;
         break;
       }
-      for (size_t si = 0; si < mmodel.seg_table.size(); si++) {
-        if (mmodel.seg_table[si] & (1ull << ei)) {
-          if (effect_group[ei] == -1)
-            effect_group[ei] = (int)si;
-          // if model effect is in multiple seg-table entries, use effect_group[ei]
-          break;
-        }
-      }
     }
   }
 
-  // groups that have at least one effect: -1 = base group (root node), then seg-table entries in
-  // index order.
-  std::vector<int> active_groups;
-  if (!has_seg_table) {
-    active_groups.push_back(-1);
-  } else {
-    std::set<int> present(effect_group.begin(), effect_group.end());
-    if (present.count(-1)) {
-      active_groups.push_back(-1);
-    }
-    for (int g = 0; g < (int)mmodel.seg_table.size(); g++) {
-      if (present.count(g)) {
-        active_groups.push_back(g);
-      }
-    }
-  }
-
-  // glTF requires at least one primitive per mesh, so only create a node and mesh for groups
-  // that will actually get geometry (each effect draw becomes one primitive). When the base
-  // group has none, there is no root node and the damage nodes become top-level scene nodes.
-  std::vector<size_t> group_draws(active_groups.size(), 0);
+  // count draws per group (0 = base/root, then seg-table entries). glTF requires at least one
+  // primitive per mesh, so only groups with geometry get a node and mesh; when the base group
+  // has none there is no root node and the damage nodes become top-level scene nodes.
+  std::vector<size_t> group_draws(mmodel.seg_table.size() + 1, 0);
   for (size_t ei = 0; ei < mmodel.effects.size(); ei++) {
-    for (size_t gi = 0; gi < active_groups.size(); gi++) {
-      if (active_groups[gi] == effect_group[ei]) {
-        group_draws[gi] += mmodel.effects[ei].all_draws.size();
-        break;
-      }
-    }
+    group_draws[effect_group[ei]] += mmodel.effects[ei].all_draws.size();
   }
 
-  // note: do not hold references into model.nodes across the loop below - adding damage/skin
-  // nodes reallocates the vector and invalidates them.
   int node_idx = -1;  // root node, only created when the base group has geometry
-  std::map<int, int> group_to_node, group_to_mesh;
-  for (size_t gi = 0; gi < active_groups.size(); gi++) {
-    int g = active_groups[gi];
-    if (group_draws[gi] == 0) {
+  int skin_idx = -1;
+  std::vector<int> group_mesh(mmodel.seg_table.size() + 1, -1);
+  std::vector<int> mesh_node_idxs;  // nodes that got a mesh (for animation weight channels)
+  for (int g = 0; g <= (int)mmodel.seg_table.size(); g++) {
+    if (group_draws[g] == 0) {
       continue;
     }
-    if (g == -1) {
-      node_idx = (int)model.nodes.size();
-      model.nodes.emplace_back();
-      model.nodes[node_idx].name = mmodel.name;
-      model.scenes.at(0).nodes.push_back(node_idx);
-      group_to_node[g] = node_idx;
-      int mesh_idx = (int)model.meshes.size();
-      auto& mesh = model.meshes.emplace_back();
-      mesh.name = mmodel.name;
-      model.nodes[node_idx].mesh = mesh_idx;
-      group_to_mesh[g] = mesh_idx;
-    } else {
-      // readable "<part>-lvl<level>" name where the vehicle class is known,
-      // otherwise fall back to the raw seg-table entry index
-      std::string group_suffix = damage_group_name(mmodel.name, g);
-      if (group_suffix.empty()) {
-        group_suffix = "damage-" + std::to_string(g);
+    // base group keeps the model name; damage groups get a readable "<part>-lvl<level>" suffix
+    // where the vehicle class is known, falling back to the raw seg-table entry index
+    std::string name = mmodel.name;
+    if (g != 0) {
+      std::string suffix = damage_group_name(mmodel.name, g - 1);
+      if (suffix.empty()) {
+        suffix = "damage-" + std::to_string(g - 1);
       }
-      std::string damage_name = mmodel.name + "-" + group_suffix;
-      int damage_node_idx = (int)model.nodes.size();
-      model.nodes.emplace_back();
-      model.nodes[damage_node_idx].name = damage_name;
-      // child of the root node, or a top-level scene node when the base group has no geometry
-      if (node_idx >= 0) {
-        model.nodes[node_idx].children.push_back(damage_node_idx);
-      } else {
-        model.scenes.at(0).nodes.push_back(damage_node_idx);
-      }
-      group_to_node[g] = damage_node_idx;
-
-      int mesh_idx = (int)model.meshes.size();
-      auto& mesh = model.meshes.emplace_back();
-      mesh.name = damage_name;
-      model.nodes[damage_node_idx].mesh = mesh_idx;
-      group_to_mesh[g] = mesh_idx;
+      name += "-" + suffix;
     }
+
+    int ni = (int)model.nodes.size();
+    model.nodes.emplace_back();
+    model.nodes[ni].name = name;
+    // damage groups are children of the root node, or top-level scene nodes when the base group
+    // has no geometry
+    if (node_idx >= 0) {
+      model.nodes[node_idx].children.push_back(ni);
+    } else {
+      model.scenes.at(0).nodes.push_back(ni);
+    }
+    if (g == 0) {
+      node_idx = ni;
+    }
+
+    int mi = (int)model.meshes.size();
+    auto& mesh = model.meshes.emplace_back();
+    mesh.name = name;
+    model.nodes[ni].mesh = mi;
+    group_mesh[g] = mi;
+    mesh_node_idxs.push_back(ni);
   }
 
   // only build a skeleton when something is actually skinned
-  if (art != art_data.end() && !art->second.joint_group.empty() && !group_to_node.empty()) {
-    int skin_idx = model.skins.size();
-    for (auto& [g, ni] : group_to_node) {
+  if (art != art_data.end() && !art->second.joint_group.empty() && !mesh_node_idxs.empty()) {
+    skin_idx = model.skins.size();
+    for (int ni : mesh_node_idxs) {
       model.nodes[ni].skin = skin_idx;
     }
     auto& skin = model.skins.emplace_back();
@@ -1886,25 +1844,16 @@ void add_merc(const tfrag3::Level& level,
   // when we have animated blend targets, blender adds an extra empty during import,
   // rename it to not conflict with the actual model
   if (num_blend_targets > 0) {
-    for (auto& [g, ni] : group_to_node) {
+    for (int ni : mesh_node_idxs) {
       model.nodes[ni].name += "_blerc";
     }
   }
 
-  if (art != art_data.end() && !art->second.anims.empty() && !group_to_node.empty()) {
-    // all group nodes share the same skin, so look it up on any of them. note: references into
-    // model.nodes may be invalid after the damage/skeleton nodes were added, so access by index.
-    int skin_idx = model.nodes.at(group_to_node.begin()->second).skin;
-    if (skin_idx >= 0 && skin_idx < (int)model.skins.size()) {
-      const auto& skin = model.skins[skin_idx];
-      std::vector<int> mesh_node_idxs;
-      for (auto& [g, ni] : group_to_node) {
-        mesh_node_idxs.push_back(ni);
-      }
-      for (const auto& ja : art->second.anims) {
-        auto uncompressed = decompress_anim(ja);
-        add_animation_to_gltf(uncompressed, skin, model, mesh_node_idxs, (int)num_blend_targets);
-      }
+  if (art != art_data.end() && !art->second.anims.empty() && skin_idx >= 0) {
+    const auto& skin = model.skins.at(skin_idx);
+    for (const auto& ja : art->second.anims) {
+      auto uncompressed = decompress_anim(ja);
+      add_animation_to_gltf(uncompressed, skin, model, mesh_node_idxs, (int)num_blend_targets);
     }
   }
 
@@ -1921,11 +1870,11 @@ void add_merc(const tfrag3::Level& level,
 
     // effects whose group had no geometry got no mesh; such effects have no draws either, so
     // there is nothing to do for them.
-    auto git = group_to_mesh.find(effect_group[effect_idx]);
-    if (git == group_to_mesh.end()) {
+    int mi = group_mesh[effect_group[effect_idx]];
+    if (mi < 0) {
       continue;
     }
-    auto& mesh = model.meshes.at(git->second);
+    auto& mesh = model.meshes.at(mi);
 
     for (size_t draw_idx = 0; draw_idx < effect.all_draws.size(); draw_idx++) {
       const auto& draw = effect.all_draws[draw_idx];
@@ -1950,11 +1899,7 @@ void add_merc(const tfrag3::Level& level,
     }
   }
 
-  std::vector<tinygltf::Mesh*> group_meshes;
-  for (auto& [g, mi] : group_to_mesh) {
-    group_meshes.push_back(&model.meshes.at(mi));
-  }
-  add_blerc_targets(level, mmodel, group_meshes, model);
+  add_blerc_targets(level, mmodel, group_mesh, model);
 }
 
 void consolidate_buffers(tinygltf::Model& model) {
