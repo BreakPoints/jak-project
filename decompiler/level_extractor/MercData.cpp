@@ -458,7 +458,9 @@ void MercCtrl::from_ref(TypedRef tr, const DecompilerTypeSystem& dts, GameVersio
     Ref arr = deref_label(get_field_ref(tr, "seg-table", dts));
     u32 seg_count = deref_u32(arr, 0);
     for (u32 i = 0; i < seg_count; i++) {
-      seg_table.push_back(((u64)deref_u32(arr, 4 + i * 2) << 32) | deref_u32(arr, 3 + i * 2));
+      u32 lo = deref_u32(arr, 3 + i * 2);
+      u32 hi = deref_u32(arr, 4 + i * 2);
+      seg_table.push_back(((u64)hi << 32) | lo);
     }
   }
 
