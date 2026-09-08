@@ -1700,8 +1700,8 @@ void add_merc(const tfrag3::Level& level,
 
   // The seg-table maps segment bits (the draw-control's seg-mask) to effect bitmasks: when a
   // segment bit is set, that entry's effects are hidden. Traffic vehicles use this for damage
-  // states - one entry per section/level, and while a section sits at level L every other entry
-  // stays active so only that level's geometry shows. Effects not covered by any entry stay on
+  // states - one entry per section/level; while a section sits at level L, the other levels'
+  // segment bits are set so their geometry is hidden. Effects not covered by any entry stay on
   // the root node; each seg-table entry becomes its own node.
   std::vector<int> effect_group(mmodel.effects.size(), 0);
   // entries are u64 bitmasks, so only the first 64 effects can be grouped; an effect listed in
@@ -1739,8 +1739,8 @@ void add_merc(const tfrag3::Level& level,
     }
 
     int ni = (int)model.nodes.size();
-    model.nodes.emplace_back();
-    model.nodes[ni].name = name;
+    auto& node = model.nodes.emplace_back();
+    node.name = name;
     // damage groups are children of the root node, or top-level scene nodes when the base group
     // has no geometry
     if (node_idx >= 0) {
@@ -1755,7 +1755,7 @@ void add_merc(const tfrag3::Level& level,
     int mi = (int)model.meshes.size();
     auto& mesh = model.meshes.emplace_back();
     mesh.name = name;
-    model.nodes[ni].mesh = mi;
+    node.mesh = mi;
     group_mesh[g] = mi;
     mesh_node_idxs.push_back(ni);
   }
