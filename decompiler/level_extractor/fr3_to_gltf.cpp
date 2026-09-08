@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <span>
 #include <tuple>
 
 #include "common/custom_data/Tfrag3Data.h"
@@ -1631,8 +1632,8 @@ struct DamageGroupName {
   int level;         // 0 = undamaged, higher = more damaged
 };
 
-// Returns "<part>-lvl<level>" for known traffic vehicles, or "" if the model/entry is unknown
-// (caller falls back to "damage-<entry>").
+// Returns a readable suffix for a seg-table entry: "<part>-lvl<level>" for known traffic
+// vehicles, or "damage-<entry>" otherwise.
 static std::string damage_group_name(const std::string& model_name, int entry) {
   // strip the lod suffix: "cara-lod0" -> "cara"
   std::string base = model_name.substr(0, model_name.find("-lod"));
@@ -1656,26 +1657,22 @@ static std::string damage_group_name(const std::string& model_name, int entry) {
       {6, "rear", 0}, {4, "rear", 1}, {2, "rear", 2},
   };
 
-  const DamageGroupName* table = nullptr;
-  size_t count = 0;
+  std::span<const DamageGroupName> table;
   if (base == "cara" || base == "carb" || base == "carc" || base == "hellcat" ||
       base == "helldog") {
     table = kCarSections;
-    count = sizeof(kCarSections) / sizeof(kCarSections[0]);
   } else if (base == "bikea" || base == "newbike") {
     table = kBikeASections;
-    count = sizeof(kBikeASections) / sizeof(kBikeASections[0]);
   } else if (base == "bikeb" || base == "bikec" || base == "crimson-bike") {
     table = kBikeBSections;
-    count = sizeof(kBikeBSections) / sizeof(kBikeBSections[0]);
   }
 
-  for (size_t i = 0; i < count; i++) {
-    if (table[i].entry == entry) {
-      return std::string(table[i].part) + "-lvl" + std::to_string(table[i].level);
+  for (const auto& d : table) {
+    if (d.entry == entry) {
+      return std::string(d.part) + "-lvl" + std::to_string(d.level);
     }
   }
-  return "";
+  return "damage-" + std::to_string(entry);
 }
 
 void add_merc(const tfrag3::Level& level,
@@ -1738,11 +1735,7 @@ void add_merc(const tfrag3::Level& level,
     // where the vehicle class is known, falling back to the raw seg-table entry index
     std::string name = mmodel.name;
     if (g != 0) {
-      std::string suffix = damage_group_name(mmodel.name, g - 1);
-      if (suffix.empty()) {
-        suffix = "damage-" + std::to_string(g - 1);
-      }
-      name += "-" + suffix;
+      name += "-" + damage_group_name(mmodel.name, g - 1);
     }
 
     int ni = (int)model.nodes.size();
